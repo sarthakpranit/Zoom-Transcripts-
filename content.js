@@ -1,48 +1,8 @@
 'use strict';
 
-// ─── Selectors ──────────────────────────────────────────────────────────────
-
-const TOOLBAR_SELECTORS = [
-  '.footer-toolbar',
-  '.meeting-footer',
-  '.meeting-toolbar',
-  '[class*="footer-toolbar"]',
-  '[class*="meeting-footer"]',
-  '[class*="bottom-bar"]',
-  '[class*="toolbar"]',
-];
-
-const CC_BUTTON_SELECTORS = [
-  'button[aria-label*="Live Transcript"]',
-  'button[aria-label*="live transcript"]',
-  'button[aria-label="CC"]',
-  'button[aria-label*="Caption"]',
-  'button[title*="Live Transcript"]',
-  '[class*="live-transcript"] button',
-  '[class*="closed-caption"] button',
-  '[class*="cc-button"] button',
-  '[class*="caption"] button',
-];
-
-const CAPTION_CONTAINER_SELECTORS = [
-  '.live-transcription-subtitle-container',
-  '.subtitle-container',
-  '[class*="live-transcription-subtitle"]',
-  '[class*="subtitle-container"]',
-  '[class*="transcription-subtitle"]',
-  '[class*="live-transcription"]',
-];
-
-const MEETING_TITLE_SELECTORS = [
-  '[class*="meeting-topic"]',
-  '[class*="meeting-info"] [class*="title"]',
-  'div.meeting-title',
-  '[class*="topic"]',
-];
-
 // ─── State ───────────────────────────────────────────────────────────────────
 
-let state = 'IDLE'; // IDLE | WAITING_FOR_UI | ENABLING_CAPTIONS | CAPTURING | ENDED
+let state = 'IDLE'; // IDLE | SEARCHING | ENABLING | CAPTURING | ENDED
 let transcript = '';
 let lastExtractedText = '';
 let meetingName = '';
@@ -51,103 +11,122 @@ let meetingId = '';
 let lineCount = 0;
 let saveInterval = null;
 let captionObserver = null;
-let toolbarObserver = null;
 let urlPollInterval = null;
+let meetingPollInterval = null;
 let finalSaveTimeout = null;
-let captionContainerParent = null;
 
 // ─── Entry Point ─────────────────────────────────────────────────────────────
 
 init();
 
 function init() {
-  meetingId = extractMeetingId(window.location.href);
   meetingDate = formatDate(new Date());
+  meetingId = extractMeetingId(window.location.href) || `mtg-${Date.now()}`;
 
-  if (!meetingId) return; // Not a meeting page
+  state = 'SEARCHING';
+  setStatus({ label: 'Searching for meeting…' });
+  console.log('[ZoomTranscript] Content script loaded, watching for meeting UI');
 
-  state = 'WAITING_FOR_UI';
-  waitForToolbar();
-  watchForMeetingEnd();
+  // Poll every 2s for meeting presence — more reliable than selector-based observers
+  // for SPAs that load React/WASM content asynchronously
+  meetingPollInterval = setInterval(pollForMeeting, 2000);
+  pollForMeeting(); // run immediately too
+
+  window.addEventListener('beforeunload', triggerFinalSave, { once: true });
+  urlPollInterval = setInterval(() => {
+    if (!window.location.href.includes('/wc/')) triggerFinalSave();
+  }, 5000);
 }
 
-// ─── Phase 1: Wait for Zoom UI to render ─────────────────────────────────────
+// ─── Phase 1: Detect active meeting ──────────────────────────────────────────
 
-function waitForToolbar() {
-  const delays = [2000, 2000, 4000, 8000, 10000, 10000, 10000, 10000]; // 60s total
-  let attempt = 0;
+function pollForMeeting() {
+  if (state !== 'SEARCHING') return;
 
-  function check() {
-    const toolbar = findElement(TOOLBAR_SELECTORS);
-    if (toolbar) {
-      onToolbarReady(toolbar);
-      return;
-    }
-    if (attempt >= delays.length) {
-      console.warn('[ZoomTranscript] Toolbar not found after 60s — giving up');
-      return;
-    }
-    setTimeout(check, delays[attempt++]);
-  }
+  if (!isMeetingActive()) return;
 
-  // Also use MutationObserver in parallel for faster detection
-  const bodyObserver = new MutationObserver(() => {
-    const toolbar = findElement(TOOLBAR_SELECTORS);
-    if (toolbar) {
-      bodyObserver.disconnect();
-      onToolbarReady(toolbar);
-    }
-  });
-  bodyObserver.observe(document.body, { childList: true, subtree: true });
-
-  check();
-}
-
-function onToolbarReady(toolbar) {
-  if (state !== 'WAITING_FOR_UI') return;
-  state = 'ENABLING_CAPTIONS';
+  clearInterval(meetingPollInterval);
+  meetingPollInterval = null;
 
   meetingName = extractMeetingName();
   console.log(`[ZoomTranscript] Meeting detected: "${meetingName}"`);
+  logDOMSnapshot(); // helps debug selector issues
 
-  watchToolbarRemoval(toolbar);
+  state = 'ENABLING';
+  setStatus({ label: `Meeting: ${meetingName}`, sub: 'Enabling transcription…' });
 
-  // Give React a moment to fully hydrate interactive elements
-  setTimeout(() => tryEnableCaptions(), 1500);
+  // Small delay so interactive elements are fully hydrated
+  setTimeout(tryEnableCaptions, 1500);
 }
 
-// ─── Phase 2: Auto-enable Live Transcript ────────────────────────────────────
+function isMeetingActive() {
+  // Video streams are the most reliable indicator of an active Zoom meeting
+  if (document.querySelectorAll('video').length > 0) return true;
+
+  // Zoom-specific container IDs
+  if (document.querySelector('#wc-container-left, #wc-container-right, #wc-content')) return true;
+
+  // Mute/camera controls — always present in a live meeting
+  for (const btn of document.querySelectorAll('button')) {
+    const label = getButtonLabel(btn);
+    if (/\b(mute|unmute|start video|stop video|join audio)\b/i.test(label)) return true;
+  }
+
+  return false;
+}
+
+// ─── Phase 2: Enable live transcript ─────────────────────────────────────────
+
+let enableAttempts = 0;
+const MAX_ENABLE_ATTEMPTS = 15; // 15 × 4s = 60s
 
 function tryEnableCaptions() {
-  if (state === 'ENDED') return;
+  if (state !== 'ENABLING') return;
 
-  // If captions already active, skip straight to observing
-  if (findElement(CAPTION_CONTAINER_SELECTORS)) {
+  // If caption container is already in DOM, skip straight to capturing
+  if (findCaptionContainer()) {
     console.log('[ZoomTranscript] Captions already active');
     startCapturing();
     return;
   }
 
-  const ccButton = findCCButton();
-  if (!ccButton) {
-    console.warn('[ZoomTranscript] CC button not found — retrying in 5s');
-    setTimeout(tryEnableCaptions, 5000);
+  enableAttempts++;
+  if (enableAttempts > MAX_ENABLE_ATTEMPTS) {
+    console.warn('[ZoomTranscript] Could not enable captions after 60s. The meeting host may have disabled Live Transcript, or the Zoom UI has changed.');
+    setStatus({ label: `Meeting: ${meetingName}`, sub: 'Transcript unavailable (host may have disabled it)' });
     return;
   }
 
-  if (ccButton.getAttribute('aria-pressed') === 'true' ||
-      ccButton.classList.contains('active') ||
-      ccButton.classList.contains('pressed')) {
-    console.log('[ZoomTranscript] CC already enabled');
-    waitForCaptionContainer();
+  // Try path 1: direct CC/transcript button visible in toolbar
+  const directBtn = findTranscriptButton();
+  if (directBtn) {
+    console.log('[ZoomTranscript] Found direct transcript button, clicking');
+    directBtn.click();
+    watchForSubmenu();
     return;
   }
 
-  console.log('[ZoomTranscript] Clicking CC button');
-  ccButton.click();
+  // Try path 2: open the "More / ..." menu first, then find transcript inside it
+  const moreBtn = findMoreButton();
+  if (moreBtn) {
+    console.log('[ZoomTranscript] Clicking "More" to find transcript option');
+    moreBtn.click();
+    setTimeout(() => {
+      const btn = findTranscriptButton();
+      if (btn) {
+        btn.click();
+        watchForSubmenu();
+      } else {
+        // Close the menu and retry
+        document.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true }));
+        setTimeout(tryEnableCaptions, 4000);
+      }
+    }, 800);
+    return;
+  }
 
-  // Watch for the submenu that appears after clicking
-  watchForSubmenu();
+  console.log(`[ZoomTranscript] Waiting for meeting controls (attempt ${enableAttempts}/${MAX_ENABLE_ATTEMPTS})…`);
+  setTimeout(tryEnableCaptions, 4000);
 }
 
 function watchForSubmenu() {
@@ -158,33 +137,38 @@ function watchForSubmenu() {
       observer.disconnect();
       return;
     }
+    // No submenu — might have toggled directly; check for caption container
+    if (findCaptionContainer()) {
+      observer.disconnect();
+      startCapturing();
+      return;
+    }
     if (Date.now() > deadline) {
       observer.disconnect();
-      // No submenu appeared — captions may have toggled directly
       waitForCaptionContainer();
     }
   });
   observer.observe(document.body, { childList: true, subtree: true });
 
-  // Also try immediately in case menu was already open
-  if (tryClickEnableTranscription()) {
+  if (tryClickEnableTranscription() || findCaptionContainer()) {
     observer.disconnect();
+    if (findCaptionContainer()) startCapturing();
   }
 }
 
 function tryClickEnableTranscription() {
-  // Look for menu items containing "Enable" or "Transcription"
-  const menuItems = document.querySelectorAll(
-    '[role="menuitem"], [role="option"], [class*="menu-item"], [class*="dropdown-item"]'
+  const candidates = document.querySelectorAll(
+    '[role="menuitem"], [role="option"], [role="listitem"], ' +
+    '[class*="menu-item"], [class*="dropdown-item"], [class*="action-item"]'
   );
 
-  for (const item of menuItems) {
-    const text = item.textContent || '';
-    if (/enable.*(auto.?transcri|caption)/i.test(text) ||
+  for (const el of candidates) {
+    const text = el.textContent || '';
+    if (/enable.*(transcri|caption)/i.test(text) ||
         /auto.?transcri/i.test(text) ||
-        (text.toLowerCase().includes('enable') && text.toLowerCase().includes('transcript'))) {
+        (/enable/i.test(text) && /transcript/i.test(text))) {
       console.log('[ZoomTranscript] Clicking "Enable Auto-Transcription"');
-      item.click();
+      el.click();
       waitForCaptionContainer();
       return true;
     }
@@ -196,18 +180,18 @@ function waitForCaptionContainer() {
   const deadline = Date.now() + 15000;
 
   const observer = new MutationObserver(() => {
-    if (findElement(CAPTION_CONTAINER_SELECTORS)) {
+    if (findCaptionContainer()) {
       observer.disconnect();
       startCapturing();
     } else if (Date.now() > deadline) {
       observer.disconnect();
-      console.warn('[ZoomTranscript] Caption container never appeared');
+      // Retry the whole enable flow
+      setTimeout(tryEnableCaptions, 3000);
     }
   });
   observer.observe(document.body, { childList: true, subtree: true });
 
-  // Check immediately too
-  if (findElement(CAPTION_CONTAINER_SELECTORS)) {
+  if (findCaptionContainer()) {
     observer.disconnect();
     startCapturing();
   }
@@ -219,32 +203,25 @@ function startCapturing() {
   if (state === 'ENDED') return;
   state = 'CAPTURING';
 
-  const container = findElement(CAPTION_CONTAINER_SELECTORS);
+  const container = findCaptionContainer();
   if (!container) {
-    console.warn('[ZoomTranscript] Caption container lost — retrying in 3s');
-    setTimeout(() => waitForCaptionContainer(), 3000);
+    setTimeout(waitForCaptionContainer, 2000);
     return;
   }
 
-  // Observe the parent so we survive React replacing the container node
-  captionContainerParent = container.parentElement || document.body;
   console.log('[ZoomTranscript] Caption observer active');
+  setStatus({ label: meetingName, sub: '0 lines captured', active: true });
 
-  captionObserver = new MutationObserver(() => onCaptionMutation());
-  captionObserver.observe(captionContainerParent, {
-    childList: true,
-    subtree: true,
-    characterData: true,
-  });
+  // Observe the parent to survive React replacing the container node itself
+  const watchTarget = container.parentElement || document.body;
+  captionObserver = new MutationObserver(onCaptionMutation);
+  captionObserver.observe(watchTarget, { childList: true, subtree: true, characterData: true });
 
-  // Start incremental saves
   saveInterval = setInterval(saveTranscript, 60_000);
-
-  updatePopupStatus();
 }
 
 function onCaptionMutation() {
-  const container = findElement(CAPTION_CONTAINER_SELECTORS);
+  const container = findCaptionContainer();
   if (!container) return;
 
   const entry = extractCaptionEntry(container);
@@ -254,22 +231,19 @@ function onCaptionMutation() {
   lineCount++;
   lastExtractedText = entry;
 
-  updatePopupStatus();
+  setStatus({ label: meetingName, sub: `${lineCount} line${lineCount === 1 ? '' : 's'} captured`, active: true });
 }
 
 function extractCaptionEntry(container) {
-  // Try to find speaker and text spans separately
   const speakerEl = container.querySelector(
-    '[class*="speaker"], [class*="name"], [class*="avatar-name"]'
+    '[class*="speaker"], [class*="name"], [class*="avatar"]'
   );
   const textEl = container.querySelector(
-    '[class*="text-content"], [class*="subtitle-text"], [class*="caption-text"]'
+    '[class*="text-content"], [class*="subtitle-text"], [class*="caption-text"], [class*="sentence"]'
   );
 
   const speaker = speakerEl?.textContent?.trim().replace(/:$/, '') || '';
   const rawText = (textEl || container).textContent?.trim() || '';
-
-  // Strip the speaker name from rawText if it's embedded at the start
   const text = speaker && rawText.startsWith(speaker)
     ? rawText.slice(speaker.length).replace(/^[:\s]+/, '')
     : rawText;
@@ -280,13 +254,10 @@ function extractCaptionEntry(container) {
   return speaker ? `[${time}] ${speaker}: ${text}` : `[${time}] ${text}`;
 }
 
-// ─── Phase 4: Saving ─────────────────────────────────────────────────────────
+// ─── Saving ───────────────────────────────────────────────────────────────────
 
 function saveTranscript() {
   if (!transcript) return;
-
-  const safeName = sanitizeFileName(meetingName);
-  const folderName = `${safeName} ${meetingDate}`;
 
   chrome.runtime.sendMessage({
     type: 'SAVE_TRANSCRIPT',
@@ -295,57 +266,20 @@ function saveTranscript() {
     meetingDate,
     transcript: buildFileContent(),
   });
-
-  chrome.runtime.sendMessage({
-    type: 'UPDATE_STATUS',
-    status: { active: true, meetingName, lineCount, folderName },
-  });
 }
 
 function buildFileContent() {
-  const header = [
+  return [
     `Meeting: ${meetingName}`,
-    `Date: ${meetingDate}`,
-    `Lines: ${lineCount}`,
+    `Date:    ${meetingDate}`,
+    `Lines:   ${lineCount}`,
     '─'.repeat(60),
     '',
+    transcript,
   ].join('\n');
-  return header + transcript;
 }
 
-function updatePopupStatus() {
-  const safeName = sanitizeFileName(meetingName);
-  chrome.runtime.sendMessage({
-    type: 'UPDATE_STATUS',
-    status: {
-      active: state === 'CAPTURING',
-      meetingName,
-      lineCount,
-      folderName: `${safeName} ${meetingDate}`,
-    },
-  });
-}
-
-// ─── Phase 5: Meeting end ────────────────────────────────────────────────────
-
-function watchForMeetingEnd() {
-  window.addEventListener('beforeunload', triggerFinalSave, { once: true });
-
-  urlPollInterval = setInterval(() => {
-    if (!window.location.href.includes('/wc/')) {
-      triggerFinalSave();
-    }
-  }, 5000);
-}
-
-function watchToolbarRemoval(toolbar) {
-  toolbarObserver = new MutationObserver(() => {
-    if (!document.contains(toolbar)) {
-      triggerFinalSave();
-    }
-  });
-  toolbarObserver.observe(document.body, { childList: true, subtree: true });
-}
+// ─── Meeting end ─────────────────────────────────────────────────────────────
 
 function triggerFinalSave() {
   if (state === 'ENDED') return;
@@ -363,13 +297,23 @@ function triggerFinalSave() {
 function cleanup() {
   clearInterval(saveInterval);
   clearInterval(urlPollInterval);
+  clearInterval(meetingPollInterval);
   captionObserver?.disconnect();
-  toolbarObserver?.disconnect();
 }
 
-// ─── Utilities ───────────────────────────────────────────────────────────────
+// ─── Finding elements ─────────────────────────────────────────────────────────
 
-function findElement(selectors) {
+function findCaptionContainer() {
+  const selectors = [
+    '.live-transcription-subtitle-container',
+    '.subtitle-container',
+    '[class*="live-transcription-subtitle"]',
+    '[class*="subtitle-container"]',
+    '[class*="transcription-subtitle"]',
+    '[class*="live-transcription"]',
+    '[class*="caption-container"]',
+    '[class*="closed-caption"]',
+  ];
   for (const sel of selectors) {
     const el = document.querySelector(sel);
     if (el) return el;
@@ -377,28 +321,78 @@ function findElement(selectors) {
   return null;
 }
 
-function findCCButton() {
-  for (const sel of CC_BUTTON_SELECTORS) {
+function findTranscriptButton() {
+  // Aria-label / title based (most reliable across Zoom versions)
+  const attrSelectors = [
+    'button[aria-label*="Live Transcript"]',
+    'button[aria-label*="live transcript"]',
+    'button[aria-label*="Transcript"]',
+    'button[aria-label="CC"]',
+    'button[aria-label*="Caption"]',
+    'button[title*="Live Transcript"]',
+    'button[title*="Transcript"]',
+    '[class*="live-transcript"] button',
+    '[class*="closed-caption"] button',
+    '[class*="cc-button"]',
+  ];
+  for (const sel of attrSelectors) {
     const el = document.querySelector(sel);
     if (el) return el;
   }
 
-  // Fallback: scan all buttons for matching text/title
+  // Fallback: scan all buttons
   for (const btn of document.querySelectorAll('button')) {
-    const label = (btn.getAttribute('aria-label') || btn.title || btn.textContent || '').toLowerCase();
-    if (/live.?transcript|closed.?caption|\bcc\b/.test(label)) {
-      return btn;
-    }
+    const label = getButtonLabel(btn);
+    if (/live.?transcript|closed.?caption|\bcc\b/i.test(label)) return btn;
   }
   return null;
 }
 
+function findMoreButton() {
+  // "More" / "..." button that hides additional toolbar items
+  const attrSelectors = [
+    'button[aria-label="More"]',
+    'button[aria-label="more"]',
+    'button[aria-label="..."]',
+    'button[title="More"]',
+    '[class*="more-button"] button',
+    '[class*="btn-more"] button',
+    '[class*="toolbar-more"] button',
+  ];
+  for (const sel of attrSelectors) {
+    const el = document.querySelector(sel);
+    if (el) return el;
+  }
+
+  for (const btn of document.querySelectorAll('button')) {
+    const label = getButtonLabel(btn);
+    if (/^(more|…|\.{3})$/i.test(label.trim())) return btn;
+  }
+  return null;
+}
+
+// ─── Utilities ───────────────────────────────────────────────────────────────
+
+function getButtonLabel(btn) {
+  return (
+    btn.getAttribute('aria-label') ||
+    btn.getAttribute('title') ||
+    btn.textContent ||
+    ''
+  ).trim();
+}
+
 function extractMeetingName() {
-  for (const sel of MEETING_TITLE_SELECTORS) {
+  const selectors = [
+    '[class*="meeting-topic"]',
+    '[class*="meeting-info"] [class*="title"]',
+    '[class*="topic"]',
+    'div.meeting-title',
+  ];
+  for (const sel of selectors) {
     const el = document.querySelector(sel);
     if (el?.textContent?.trim()) return el.textContent.trim();
   }
-  // Fallback to browser tab title
   return (document.title || 'Zoom Meeting')
     .replace(/\s*[-–|]\s*Zoom\s*/i, '')
     .trim() || 'Zoom Meeting';
@@ -410,10 +404,7 @@ function extractMeetingId(url) {
 }
 
 function formatDate(d) {
-  const y = d.getFullYear();
-  const mo = String(d.getMonth() + 1).padStart(2, '0');
-  const day = String(d.getDate()).padStart(2, '0');
-  return `${y}-${mo}-${day}`;
+  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
 }
 
 function sanitizeFileName(name) {
@@ -422,4 +413,30 @@ function sanitizeFileName(name) {
     .replace(/\s+/g, ' ')
     .trim()
     .slice(0, 80);
+}
+
+function setStatus(opts) {
+  const safeName = sanitizeFileName(meetingName || 'Zoom Meeting');
+  chrome.runtime.sendMessage({
+    type: 'UPDATE_STATUS',
+    status: {
+      active: opts.active || false,
+      meetingName: meetingName || opts.label || '',
+      label: opts.label || '',
+      sub: opts.sub || '',
+      lineCount,
+      folderName: `${safeName} ${meetingDate}`,
+    },
+  });
+}
+
+// Logs a snapshot of what's in the DOM — helps debug selector issues
+function logDOMSnapshot() {
+  const buttons = Array.from(document.querySelectorAll('button'))
+    .slice(0, 30)
+    .map(b => getButtonLabel(b))
+    .filter(Boolean);
+  console.log('[ZoomTranscript] Buttons found in DOM:', buttons);
+  console.log('[ZoomTranscript] Video elements:', document.querySelectorAll('video').length);
+  console.log('[ZoomTranscript] Page title:', document.title);
 }
