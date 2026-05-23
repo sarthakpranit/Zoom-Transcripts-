@@ -2,17 +2,16 @@
 
 // ─── State ───────────────────────────────────────────────────────────────────
 
-let state = 'IDLE'; // IDLE | SEARCHING | ENABLING | CAPTURING | ENDED
+let state = 'WAITING'; // WAITING | ENABLING | CAPTURING | ENDED
 let transcript = '';
 let lastExtractedText = '';
-let meetingName = '';
+let meetingName = 'Zoom Meeting';
 let meetingDate = '';
 let meetingId = '';
 let lineCount = 0;
 let saveInterval = null;
 let captionObserver = null;
 let urlPollInterval = null;
-let meetingPollInterval = null;
 let finalSaveTimeout = null;
 
 // ─── Entry Point ─────────────────────────────────────────────────────────────
@@ -23,14 +22,25 @@ function init() {
   meetingDate = formatDate(new Date());
   meetingId = extractMeetingId(window.location.href) || `mtg-${Date.now()}`;
 
-  state = 'SEARCHING';
-  setStatus({ label: 'Searching for meeting…' });
-  console.log('[ZoomTranscript] Content script loaded, watching for meeting UI');
+  // We're on a /wc/ URL — this is always a Zoom meeting page.
+  // Skip DOM-based "is meeting active?" checks (Zoom renders video on <canvas>
+  // and may use Shadow DOM, making standard querySelector unreliable).
+  // Just wait for the meeting UI to finish loading, then start finding the CC button.
+  state = 'WAITING';
+  setStatus({ sub: 'Waiting for meeting to start…' });
+  console.log('[ZoomTranscript] Loaded on Zoom meeting page, waiting for UI…');
 
-  // Poll every 2s for meeting presence — more reliable than selector-based observers
-  // for SPAs that load React/WASM content asynchronously
-  meetingPollInterval = setInterval(pollForMeeting, 2000);
-  pollForMeeting(); // run immediately too
+  // Refresh meeting name as the page hydrates
+  const namePoller = setInterval(() => {
+    const name = extractMeetingName();
+    if (name && name !== 'Zoom Meeting') {
+      meetingName = name;
+      clearInterval(namePoller);
+    }
+  }, 2000);
+
+  // Give Zoom's React/WASM app time to render meeting controls
+  setTimeout(beginEnabling, 6000);
 
   window.addEventListener('beforeunload', triggerFinalSave, { once: true });
   urlPollInterval = setInterval(() => {
@@ -38,52 +48,25 @@ function init() {
   }, 5000);
 }
 
-// ─── Phase 1: Detect active meeting ──────────────────────────────────────────
-
-function pollForMeeting() {
-  if (state !== 'SEARCHING') return;
-
-  if (!isMeetingActive()) return;
-
-  clearInterval(meetingPollInterval);
-  meetingPollInterval = null;
-
-  meetingName = extractMeetingName();
-  console.log(`[ZoomTranscript] Meeting detected: "${meetingName}"`);
-  logDOMSnapshot(); // helps debug selector issues
-
-  state = 'ENABLING';
-  setStatus({ label: `Meeting: ${meetingName}`, sub: 'Enabling transcription…' });
-
-  // Small delay so interactive elements are fully hydrated
-  setTimeout(tryEnableCaptions, 1500);
-}
-
-function isMeetingActive() {
-  // Video streams are the most reliable indicator of an active Zoom meeting
-  if (document.querySelectorAll('video').length > 0) return true;
-
-  // Zoom-specific container IDs
-  if (document.querySelector('#wc-container-left, #wc-container-right, #wc-content')) return true;
-
-  // Mute/camera controls — always present in a live meeting
-  for (const btn of document.querySelectorAll('button')) {
-    const label = getButtonLabel(btn);
-    if (/\b(mute|unmute|start video|stop video|join audio)\b/i.test(label)) return true;
-  }
-
-  return false;
-}
-
-// ─── Phase 2: Enable live transcript ─────────────────────────────────────────
+// ─── Enable Live Transcript ───────────────────────────────────────────────────
 
 let enableAttempts = 0;
-const MAX_ENABLE_ATTEMPTS = 15; // 15 × 4s = 60s
+const MAX_ATTEMPTS = 20; // 20 × 5s = 100s of retrying
+
+function beginEnabling() {
+  if (state === 'ENDED') return;
+  state = 'ENABLING';
+  meetingName = extractMeetingName();
+  console.log(`[ZoomTranscript] Starting caption enable (meeting: "${meetingName}")`);
+  logDOMSnapshot();
+  setStatus({ sub: 'Enabling transcription…' });
+  tryEnableCaptions();
+}
 
 function tryEnableCaptions() {
-  if (state !== 'ENABLING') return;
+  if (state === 'ENDED') return;
 
-  // If caption container is already in DOM, skip straight to capturing
+  // Already active — go straight to capturing
   if (findCaptionContainer()) {
     console.log('[ZoomTranscript] Captions already active');
     startCapturing();
@@ -91,25 +74,27 @@ function tryEnableCaptions() {
   }
 
   enableAttempts++;
-  if (enableAttempts > MAX_ENABLE_ATTEMPTS) {
-    console.warn('[ZoomTranscript] Could not enable captions after 60s. The meeting host may have disabled Live Transcript, or the Zoom UI has changed.');
-    setStatus({ label: `Meeting: ${meetingName}`, sub: 'Transcript unavailable (host may have disabled it)' });
+  if (enableAttempts > MAX_ATTEMPTS) {
+    console.warn('[ZoomTranscript] Could not find the Live Transcript button after 100s.');
+    console.warn('[ZoomTranscript] Either the host has disabled it, or the UI selectors need updating.');
+    console.warn('[ZoomTranscript] Open DevTools and run: document.querySelectorAll("button") to inspect buttons.');
+    setStatus({ sub: 'Live Transcript unavailable — check console for details' });
     return;
   }
 
-  // Try path 1: direct CC/transcript button visible in toolbar
+  // Path 1: transcript button directly visible
   const directBtn = findTranscriptButton();
   if (directBtn) {
-    console.log('[ZoomTranscript] Found direct transcript button, clicking');
+    console.log('[ZoomTranscript] Found transcript button directly, clicking');
     directBtn.click();
     watchForSubmenu();
     return;
   }
 
-  // Try path 2: open the "More / ..." menu first, then find transcript inside it
+  // Path 2: transcript button is inside the "More / ..." overflow menu
   const moreBtn = findMoreButton();
   if (moreBtn) {
-    console.log('[ZoomTranscript] Clicking "More" to find transcript option');
+    console.log('[ZoomTranscript] Clicking "More" menu to reveal transcript option');
     moreBtn.click();
     setTimeout(() => {
       const btn = findTranscriptButton();
@@ -117,16 +102,17 @@ function tryEnableCaptions() {
         btn.click();
         watchForSubmenu();
       } else {
-        // Close the menu and retry
+        // Close menu and retry
         document.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true }));
-        setTimeout(tryEnableCaptions, 4000);
+        console.log(`[ZoomTranscript] Transcript not in More menu yet, retry ${enableAttempts}/${MAX_ATTEMPTS}`);
+        setTimeout(tryEnableCaptions, 5000);
       }
     }, 800);
     return;
   }
 
-  console.log(`[ZoomTranscript] Waiting for meeting controls (attempt ${enableAttempts}/${MAX_ENABLE_ATTEMPTS})…`);
-  setTimeout(tryEnableCaptions, 4000);
+  console.log(`[ZoomTranscript] Controls not ready yet, retry ${enableAttempts}/${MAX_ATTEMPTS}`);
+  setTimeout(tryEnableCaptions, 5000);
 }
 
 function watchForSubmenu() {
@@ -137,7 +123,6 @@ function watchForSubmenu() {
       observer.disconnect();
       return;
     }
-    // No submenu — might have toggled directly; check for caption container
     if (findCaptionContainer()) {
       observer.disconnect();
       startCapturing();
@@ -161,7 +146,6 @@ function tryClickEnableTranscription() {
     '[role="menuitem"], [role="option"], [role="listitem"], ' +
     '[class*="menu-item"], [class*="dropdown-item"], [class*="action-item"]'
   );
-
   for (const el of candidates) {
     const text = el.textContent || '';
     if (/enable.*(transcri|caption)/i.test(text) ||
@@ -185,7 +169,6 @@ function waitForCaptionContainer() {
       startCapturing();
     } else if (Date.now() > deadline) {
       observer.disconnect();
-      // Retry the whole enable flow
       setTimeout(tryEnableCaptions, 3000);
     }
   });
@@ -197,7 +180,7 @@ function waitForCaptionContainer() {
   }
 }
 
-// ─── Phase 3: Observe captions ───────────────────────────────────────────────
+// ─── Capture ──────────────────────────────────────────────────────────────────
 
 function startCapturing() {
   if (state === 'ENDED') return;
@@ -209,10 +192,9 @@ function startCapturing() {
     return;
   }
 
-  console.log('[ZoomTranscript] Caption observer active');
-  setStatus({ label: meetingName, sub: '0 lines captured', active: true });
+  console.log('[ZoomTranscript] Caption observer active — transcribing');
+  setStatus({ sub: '0 lines captured', active: true });
 
-  // Observe the parent to survive React replacing the container node itself
   const watchTarget = container.parentElement || document.body;
   captionObserver = new MutationObserver(onCaptionMutation);
   captionObserver.observe(watchTarget, { childList: true, subtree: true, characterData: true });
@@ -231,13 +213,11 @@ function onCaptionMutation() {
   lineCount++;
   lastExtractedText = entry;
 
-  setStatus({ label: meetingName, sub: `${lineCount} line${lineCount === 1 ? '' : 's'} captured`, active: true });
+  setStatus({ sub: `${lineCount} line${lineCount === 1 ? '' : 's'} captured`, active: true });
 }
 
 function extractCaptionEntry(container) {
-  const speakerEl = container.querySelector(
-    '[class*="speaker"], [class*="name"], [class*="avatar"]'
-  );
+  const speakerEl = container.querySelector('[class*="speaker"], [class*="name"], [class*="avatar"]');
   const textEl = container.querySelector(
     '[class*="text-content"], [class*="subtitle-text"], [class*="caption-text"], [class*="sentence"]'
   );
@@ -258,7 +238,6 @@ function extractCaptionEntry(container) {
 
 function saveTranscript() {
   if (!transcript) return;
-
   chrome.runtime.sendMessage({
     type: 'SAVE_TRANSCRIPT',
     meetingId,
@@ -279,29 +258,27 @@ function buildFileContent() {
   ].join('\n');
 }
 
-// ─── Meeting end ─────────────────────────────────────────────────────────────
+// ─── Meeting end ──────────────────────────────────────────────────────────────
 
 function triggerFinalSave() {
   if (state === 'ENDED') return;
   state = 'ENDED';
-
   clearTimeout(finalSaveTimeout);
   finalSaveTimeout = setTimeout(() => {
     cleanup();
     saveTranscript();
     chrome.runtime.sendMessage({ type: 'UPDATE_STATUS', status: { active: false } });
-    console.log('[ZoomTranscript] Final save triggered');
+    console.log('[ZoomTranscript] Meeting ended — final save done');
   }, 300);
 }
 
 function cleanup() {
   clearInterval(saveInterval);
   clearInterval(urlPollInterval);
-  clearInterval(meetingPollInterval);
   captionObserver?.disconnect();
 }
 
-// ─── Finding elements ─────────────────────────────────────────────────────────
+// ─── Element finders ──────────────────────────────────────────────────────────
 
 function findCaptionContainer() {
   const selectors = [
@@ -322,7 +299,6 @@ function findCaptionContainer() {
 }
 
 function findTranscriptButton() {
-  // Aria-label / title based (most reliable across Zoom versions)
   const attrSelectors = [
     'button[aria-label*="Live Transcript"]',
     'button[aria-label*="live transcript"]',
@@ -339,47 +315,39 @@ function findTranscriptButton() {
     const el = document.querySelector(sel);
     if (el) return el;
   }
-
-  // Fallback: scan all buttons
   for (const btn of document.querySelectorAll('button')) {
-    const label = getButtonLabel(btn);
+    const label = getLabel(btn);
     if (/live.?transcript|closed.?caption|\bcc\b/i.test(label)) return btn;
   }
   return null;
 }
 
 function findMoreButton() {
-  // "More" / "..." button that hides additional toolbar items
   const attrSelectors = [
     'button[aria-label="More"]',
     'button[aria-label="more"]',
-    'button[aria-label="..."]',
+    'button[aria-label="More options"]',
     'button[title="More"]',
+    'button[title="More options"]',
     '[class*="more-button"] button',
-    '[class*="btn-more"] button',
+    '[class*="btn-more"]',
     '[class*="toolbar-more"] button',
   ];
   for (const sel of attrSelectors) {
     const el = document.querySelector(sel);
     if (el) return el;
   }
-
   for (const btn of document.querySelectorAll('button')) {
-    const label = getButtonLabel(btn);
-    if (/^(more|…|\.{3})$/i.test(label.trim())) return btn;
+    const label = getLabel(btn).trim();
+    if (/^(more|more options|…|\.{3})$/i.test(label)) return btn;
   }
   return null;
 }
 
-// ─── Utilities ───────────────────────────────────────────────────────────────
+// ─── Utilities ────────────────────────────────────────────────────────────────
 
-function getButtonLabel(btn) {
-  return (
-    btn.getAttribute('aria-label') ||
-    btn.getAttribute('title') ||
-    btn.textContent ||
-    ''
-  ).trim();
+function getLabel(btn) {
+  return (btn.getAttribute('aria-label') || btn.getAttribute('title') || btn.textContent || '').trim();
 }
 
 function extractMeetingName() {
@@ -393,9 +361,7 @@ function extractMeetingName() {
     const el = document.querySelector(sel);
     if (el?.textContent?.trim()) return el.textContent.trim();
   }
-  return (document.title || 'Zoom Meeting')
-    .replace(/\s*[-–|]\s*Zoom\s*/i, '')
-    .trim() || 'Zoom Meeting';
+  return (document.title || 'Zoom Meeting').replace(/\s*[-–|]\s*Zoom\s*/i, '').trim() || 'Zoom Meeting';
 }
 
 function extractMeetingId(url) {
@@ -408,21 +374,17 @@ function formatDate(d) {
 }
 
 function sanitizeFileName(name) {
-  return (name || 'Zoom Meeting')
-    .replace(/[/\\:*?"<>|]/g, '-')
-    .replace(/\s+/g, ' ')
-    .trim()
-    .slice(0, 80);
+  return (name || 'Zoom Meeting').replace(/[/\\:*?"<>|]/g, '-').replace(/\s+/g, ' ').trim().slice(0, 80);
 }
 
 function setStatus(opts) {
-  const safeName = sanitizeFileName(meetingName || 'Zoom Meeting');
+  const safeName = sanitizeFileName(meetingName);
   chrome.runtime.sendMessage({
     type: 'UPDATE_STATUS',
     status: {
       active: opts.active || false,
-      meetingName: meetingName || opts.label || '',
-      label: opts.label || '',
+      meetingName,
+      label: meetingName,
       sub: opts.sub || '',
       lineCount,
       folderName: `${safeName} ${meetingDate}`,
@@ -430,13 +392,14 @@ function setStatus(opts) {
   });
 }
 
-// Logs a snapshot of what's in the DOM — helps debug selector issues
 function logDOMSnapshot() {
   const buttons = Array.from(document.querySelectorAll('button'))
-    .slice(0, 30)
-    .map(b => getButtonLabel(b))
-    .filter(Boolean);
-  console.log('[ZoomTranscript] Buttons found in DOM:', buttons);
-  console.log('[ZoomTranscript] Video elements:', document.querySelectorAll('video').length);
+    .map(b => getLabel(b))
+    .filter(Boolean)
+    .slice(0, 40);
+  console.log('[ZoomTranscript] All buttons in DOM:', buttons);
+  console.log('[ZoomTranscript] <video> count:', document.querySelectorAll('video').length);
+  console.log('[ZoomTranscript] <canvas> count:', document.querySelectorAll('canvas').length);
   console.log('[ZoomTranscript] Page title:', document.title);
+  console.log('[ZoomTranscript] URL:', window.location.href);
 }
