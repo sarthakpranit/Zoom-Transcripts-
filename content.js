@@ -6,6 +6,8 @@ let state = 'WAITING'; // WAITING | ENABLING | CAPTURING | ENDED
 let transcript = '';
 let lastCommittedText = ''; // full container text as of last commit
 let commitTimer = null;     // debounce handle
+let currentSpeaker = '';    // last known speaker — persists across continuation lines
+let hasLoggedCaptionHTML = false;
 let meetingName = 'Zoom Meeting';
 let meetingDate = '';
 let meetingId = '';
@@ -216,6 +218,13 @@ function onCaptionMutation() {
 }
 
 function commitCaption(container) {
+  // Log the HTML structure once so selector issues can be debugged from console
+  if (!hasLoggedCaptionHTML) {
+    hasLoggedCaptionHTML = true;
+    console.log('[ZoomTranscript] Caption container outerHTML:', container.outerHTML?.slice(0, 1000));
+    console.log('[ZoomTranscript] Caption parent outerHTML:', container.parentElement?.outerHTML?.slice(0, 1500));
+  }
+
   const rawText = (container.textContent || '').replace(/\s+/g, ' ').trim();
   if (!rawText || rawText === lastCommittedText) return;
 
@@ -225,49 +234,76 @@ function commitCaption(container) {
   if (lastCommittedText && rawText.startsWith(lastCommittedText)) {
     newText = rawText.slice(lastCommittedText.length).trim();
   } else {
-    // Caption window reset or completely new content
     newText = rawText;
   }
 
   lastCommittedText = rawText;
-
   if (!newText || isSystemMessage(newText)) return;
 
-  const speaker = extractSpeaker(container);
+  // Resolve speaker — update tracked speaker when a new one is detected,
+  // otherwise fall back to the last known speaker (continuation lines).
+  const detected = extractSpeaker(container, newText);
+  if (detected.speaker) currentSpeaker = detected.speaker;
+  const speakerLabel = currentSpeaker;
+  const textBody = detected.text; // may have "Name:" prefix stripped
+
   const time = new Date().toTimeString().slice(0, 8);
-  const line = speaker ? `[${time}] ${speaker}: ${newText}` : `[${time}] ${newText}`;
+  const line = speakerLabel
+    ? `[${time}] ${speakerLabel}: ${textBody}`
+    : `[${time}] ${textBody}`;
   transcript += line + '\n';
   lineCount++;
   setStatus({ sub: `${lineCount} line${lineCount === 1 ? '' : 's'} captured`, active: true });
 }
 
-function extractSpeaker(container) {
-  // Try known Zoom speaker-name element patterns
-  const speakerSelectors = [
+function extractSpeaker(container, newText) {
+  const SPEAKER_SELECTORS = [
     '[class*="speaker-name"]',
     '[class*="speaker_name"]',
     '[class*="tlc-speaker"]',
+    '[class*="subtitle-speaker"]',
+    '[class*="caption-speaker"]',
     '[class*="attribution"]',
     '[class*="author"]',
+    '[class*="sender"]',
+    '[class*="user-name"]',
+    '[class*="display-name"]',
   ];
-  for (const sel of speakerSelectors) {
-    const el = container.querySelector(sel);
-    const name = el?.textContent?.trim().replace(/:$/, '');
-    if (name) return name;
-  }
 
-  // Fallback: if the text starts with "Name: content", parse the name out.
-  // Zoom often renders speaker + speech as a single text node: "John Doe: Hello"
-  const text = container.textContent || '';
-  const colonIdx = text.indexOf(':');
-  if (colonIdx > 0 && colonIdx < 40) {
-    const candidate = text.slice(0, colonIdx).trim();
-    // Sanity check: looks like a name (no digits, reasonable length, no line breaks)
-    if (candidate.length >= 2 && !/\d/.test(candidate) && !/\n/.test(candidate)) {
-      return candidate;
+  // Search order: container itself → parent → grandparent
+  // Speaker name is often a sibling element to the text node, so the parent
+  // or grandparent wraps both the name and the caption text.
+  const searchRoots = [
+    container,
+    container.parentElement,
+    container.parentElement?.parentElement,
+  ].filter(Boolean);
+
+  for (const root of searchRoots) {
+    for (const sel of SPEAKER_SELECTORS) {
+      const el = root.querySelector(sel);
+      const name = el?.textContent?.trim().replace(/:$/, '').trim();
+      if (name && name.length >= 2 && name.length <= 60) {
+        return { speaker: name, text: newText };
+      }
     }
   }
-  return '';
+
+  // Fallback: if Zoom embeds "Name: speech" in the text itself, parse and strip it.
+  const colonIdx = newText.indexOf(':');
+  if (colonIdx > 1 && colonIdx < 50) {
+    const candidate = newText.slice(0, colonIdx).trim();
+    if (
+      candidate.length >= 2 &&
+      !/\d/.test(candidate) &&
+      !/\n/.test(candidate) &&
+      /^[\p{L}\s'.,-]+$/u.test(candidate)
+    ) {
+      return { speaker: candidate, text: newText.slice(colonIdx + 1).trim() };
+    }
+  }
+
+  return { speaker: '', text: newText };
 }
 
 function isSystemMessage(text) {
