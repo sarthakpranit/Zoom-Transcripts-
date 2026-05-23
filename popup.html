@@ -1,0 +1,65 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      width: 300px;
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+      padding: 14px 16px;
+      color: #1e293b;
+      background: #fff;
+    }
+    h2 {
+      font-size: 13px;
+      font-weight: 600;
+      color: #64748b;
+      text-transform: uppercase;
+      letter-spacing: 0.05em;
+      margin-bottom: 12px;
+    }
+    .row {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+    }
+    .dot {
+      flex-shrink: 0;
+      width: 9px;
+      height: 9px;
+      border-radius: 50%;
+    }
+    .dot-active { background: #22c55e; }
+    .dot-idle   { background: #cbd5e1; }
+    .meeting-name {
+      font-weight: 600;
+      font-size: 14px;
+      line-height: 1.3;
+    }
+    .meta {
+      margin-top: 6px;
+      margin-left: 17px;
+      font-size: 12px;
+      color: #64748b;
+      line-height: 1.6;
+    }
+    .path {
+      margin-top: 10px;
+      margin-left: 17px;
+      font-size: 11px;
+      color: #94a3b8;
+      word-break: break-all;
+    }
+    .idle-text {
+      font-size: 13px;
+      color: #94a3b8;
+    }
+  </style>
+</head>
+<body>
+  <h2>Zoom Transcript Saver</h2>
+  <div id="content"></div>
+  <script src="popup.js"></script>
+</body>
+</html>
