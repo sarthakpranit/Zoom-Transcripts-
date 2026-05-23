@@ -233,10 +233,41 @@ function commitCaption(container) {
 
   if (!newText || isSystemMessage(newText)) return;
 
+  const speaker = extractSpeaker(container);
   const time = new Date().toTimeString().slice(0, 8);
-  transcript += `[${time}] ${newText}\n`;
+  const line = speaker ? `[${time}] ${speaker}: ${newText}` : `[${time}] ${newText}`;
+  transcript += line + '\n';
   lineCount++;
   setStatus({ sub: `${lineCount} line${lineCount === 1 ? '' : 's'} captured`, active: true });
+}
+
+function extractSpeaker(container) {
+  // Try known Zoom speaker-name element patterns
+  const speakerSelectors = [
+    '[class*="speaker-name"]',
+    '[class*="speaker_name"]',
+    '[class*="tlc-speaker"]',
+    '[class*="attribution"]',
+    '[class*="author"]',
+  ];
+  for (const sel of speakerSelectors) {
+    const el = container.querySelector(sel);
+    const name = el?.textContent?.trim().replace(/:$/, '');
+    if (name) return name;
+  }
+
+  // Fallback: if the text starts with "Name: content", parse the name out.
+  // Zoom often renders speaker + speech as a single text node: "John Doe: Hello"
+  const text = container.textContent || '';
+  const colonIdx = text.indexOf(':');
+  if (colonIdx > 0 && colonIdx < 40) {
+    const candidate = text.slice(0, colonIdx).trim();
+    // Sanity check: looks like a name (no digits, reasonable length, no line breaks)
+    if (candidate.length >= 2 && !/\d/.test(candidate) && !/\n/.test(candidate)) {
+      return candidate;
+    }
+  }
+  return '';
 }
 
 function isSystemMessage(text) {

@@ -7,60 +7,56 @@
     body {
       width: 300px;
       font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
-      padding: 14px 16px;
+      padding: 14px 16px 16px;
       color: #1e293b;
       background: #fff;
     }
     h2 {
-      font-size: 13px;
+      font-size: 12px;
       font-weight: 600;
       color: #64748b;
       text-transform: uppercase;
       letter-spacing: 0.05em;
       margin-bottom: 12px;
     }
-    .row {
-      display: flex;
-      align-items: center;
-      gap: 8px;
-    }
-    .dot {
-      flex-shrink: 0;
-      width: 9px;
-      height: 9px;
-      border-radius: 50%;
-    }
+    .row { display: flex; align-items: center; gap: 8px; }
+    .dot { flex-shrink: 0; width: 9px; height: 9px; border-radius: 50%; }
     .dot-active  { background: #22c55e; }
     .dot-idle    { background: #cbd5e1; }
     .dot-waiting { background: #f59e0b; }
-    .meeting-name {
-      font-weight: 600;
-      font-size: 14px;
-      line-height: 1.3;
-    }
-    .meta {
-      margin-top: 6px;
-      margin-left: 17px;
-      font-size: 12px;
-      color: #64748b;
-      line-height: 1.6;
-    }
-    .path {
-      margin-top: 10px;
-      margin-left: 17px;
+    .meeting-name { font-weight: 600; font-size: 14px; line-height: 1.3; }
+    .meta  { margin: 5px 0 0 17px; font-size: 12px; color: #64748b; }
+    .path  { margin: 3px 0 0 17px; font-size: 11px; color: #94a3b8; word-break: break-all; }
+    .idle-text { font-size: 13px; color: #94a3b8; }
+
+    .divider { border: none; border-top: 1px solid #f1f5f9; margin: 12px 0; }
+
+    .folder-row { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+    .folder-label { font-size: 12px; color: #64748b; flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .folder-label.unset { color: #f59e0b; font-weight: 500; }
+    button {
+      flex-shrink: 0;
       font-size: 11px;
-      color: #94a3b8;
-      word-break: break-all;
+      padding: 4px 10px;
+      border-radius: 5px;
+      border: 1px solid #e2e8f0;
+      background: #f8fafc;
+      color: #475569;
+      cursor: pointer;
     }
-    .idle-text {
-      font-size: 13px;
-      color: #94a3b8;
-    }
+    button:hover { background: #f1f5f9; }
+    #folder-error { font-size: 11px; color: #ef4444; margin-top: 4px; display: none; }
   </style>
 </head>
 <body>
   <h2>Zoom Transcript Saver</h2>
-  <div id="content"></div>
+  <div id="status"></div>
+  <hr class="divider">
+  <div class="folder-row">
+    <span id="folder-label" class="folder-label unset">No save folder set</span>
+    <button id="folder-btn">Choose Folder</button>
+  </div>
+  <div id="folder-error"></div>
   <script src="popup.js"></script>
 </body>
 </html>
