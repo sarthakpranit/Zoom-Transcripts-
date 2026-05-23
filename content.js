@@ -4,7 +4,8 @@
 
 let state = 'WAITING'; // WAITING | ENABLING | CAPTURING | ENDED
 let transcript = '';
-let lastExtractedText = '';
+let lastCommittedText = ''; // full container text as of last commit
+let commitTimer = null;     // debounce handle
 let meetingName = 'Zoom Meeting';
 let meetingDate = '';
 let meetingId = '';
@@ -208,33 +209,38 @@ function startCapturing() {
 function onCaptionMutation() {
   const container = findCaptionContainer();
   if (!container) return;
+  // Debounce: Zoom updates captions word-by-word. Wait for a pause before
+  // committing so we capture complete phrases, not every intermediate state.
+  clearTimeout(commitTimer);
+  commitTimer = setTimeout(() => commitCaption(container), 1500);
+}
 
-  const entry = extractCaptionEntry(container);
-  if (!entry) return;
+function commitCaption(container) {
+  const rawText = (container.textContent || '').replace(/\s+/g, ' ').trim();
+  if (!rawText || rawText === lastCommittedText) return;
 
-  transcript += entry + '\n';
+  // Zoom's caption container grows as the speaker talks — each new word
+  // appends to the end. Extract only the genuinely new portion.
+  let newText;
+  if (lastCommittedText && rawText.startsWith(lastCommittedText)) {
+    newText = rawText.slice(lastCommittedText.length).trim();
+  } else {
+    // Caption window reset or completely new content
+    newText = rawText;
+  }
+
+  lastCommittedText = rawText;
+
+  if (!newText || isSystemMessage(newText)) return;
+
+  const time = new Date().toTimeString().slice(0, 8);
+  transcript += `[${time}] ${newText}\n`;
   lineCount++;
-  lastExtractedText = entry;
-
   setStatus({ sub: `${lineCount} line${lineCount === 1 ? '' : 's'} captured`, active: true });
 }
 
-function extractCaptionEntry(container) {
-  const speakerEl = container.querySelector('[class*="speaker"], [class*="name"], [class*="avatar"]');
-  const textEl = container.querySelector(
-    '[class*="text-content"], [class*="subtitle-text"], [class*="caption-text"], [class*="sentence"]'
-  );
-
-  const speaker = speakerEl?.textContent?.trim().replace(/:$/, '') || '';
-  const rawText = (textEl || container).textContent?.trim() || '';
-  const text = speaker && rawText.startsWith(speaker)
-    ? rawText.slice(speaker.length).replace(/^[:\s]+/, '')
-    : rawText;
-
-  if (!text || text === lastExtractedText) return null;
-
-  const time = new Date().toTimeString().slice(0, 8);
-  return speaker ? `[${time}] ${speaker}: ${text}` : `[${time}] ${text}`;
+function isSystemMessage(text) {
+  return /^you have (turned|enabled|disabled)|recording has (started|stopped)|this meeting is being recorded|waiting for the host/i.test(text.trim());
 }
 
 // ─── Saving ───────────────────────────────────────────────────────────────────
