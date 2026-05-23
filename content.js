@@ -45,9 +45,25 @@ function init() {
   // Give Zoom's React/WASM app time to render meeting controls
   setTimeout(beginEnabling, 6000);
 
-  window.addEventListener('beforeunload', triggerFinalSave, { once: true });
+  // Save immediately on beforeunload — no setTimeout, because the iframe is
+  // torn down before any async timer can fire when the meeting page navigates away.
+  window.addEventListener('beforeunload', () => {
+    if (state === 'ENDED') return;
+    state = 'ENDED';
+    cleanup();
+    saveTranscript();
+  }, { once: true });
+
+  // Poll the TOP-LEVEL URL (not the iframe's own URL) so we detect when the
+  // meeting page navigates away even when this script runs inside an iframe.
   urlPollInterval = setInterval(() => {
-    if (!window.location.href.includes('/wc/')) triggerFinalSave();
+    try {
+      const topUrl = window.top.location.href;
+      if (!topUrl.includes('/wc/')) triggerFinalSave();
+    } catch {
+      // Cross-origin top frame — fall back to own URL
+      if (!window.location.href.includes('/wc/')) triggerFinalSave();
+    }
   }, 5000);
 }
 
