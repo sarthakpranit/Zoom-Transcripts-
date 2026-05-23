@@ -77,8 +77,11 @@ function tryEnableCaptions() {
   if (enableAttempts > MAX_ATTEMPTS) {
     console.warn('[ZoomTranscript] Could not find the Live Transcript button after 100s.');
     console.warn('[ZoomTranscript] Either the host has disabled it, or the UI selectors need updating.');
-    console.warn('[ZoomTranscript] Open DevTools and run: document.querySelectorAll("button") to inspect buttons.');
-    setStatus({ sub: 'Live Transcript unavailable — check console for details' });
+    // Only report failure from the top frame — if all_frames:true caused this script
+    // to run in the outer shell (zero buttons), the iframe instance may still be working.
+    if (window.self === window.top) {
+      setStatus({ sub: 'Live Transcript unavailable — check console for details' });
+    }
     return;
   }
 
